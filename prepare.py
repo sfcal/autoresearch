@@ -1,389 +1,349 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+Fixed rules, lexicon and scoring for the Scrabble autoresearch experiments.
+
+The goal of the search (train.py) is the highest-scoring single Scrabble play
+that can occur in a legal game. A solution is a *game*: an ordered list of
+plays starting from an empty board. Every play is validated against the rules
+and the lexicon, and the metric is the score of the LAST play. Requiring the
+whole game (not just a final board) proves that the position is reachable.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    python prepare.py                         # check lexicon + scorer self-tests
+    python prepare.py --verify solution.json  # independently re-score a solution
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+The lexicon is read from NWL2023.txt next to this file.
 """
 
 import os
 import sys
-import time
-import math
+import json
 import argparse
-import pickle
-from multiprocessing import Pool
-
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
-import torch
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+TIME_BUDGET = 300        # search time budget in seconds (5 minutes)
+BOARD_SIZE = 15
+CENTER = (7, 7)
+RACK_SIZE = 7            # max tiles placed in a single play
+BINGO_BONUS = 50         # bonus for placing all 7 tiles
+TOTAL_TILES = 100
+# The game ends when a player empties their rack with the bag empty, and a
+# player's rack is only ever empty at that moment. So whenever a play is made
+# the opponent still holds at least one tile: the board never exceeds 99 tiles.
+MAX_TILES_ON_BOARD = TOTAL_TILES - 1
+
+LEXICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "NWL2023.txt")
+
+BLANK = "?"
+TILE_COUNTS = {
+    "A": 9, "B": 2, "C": 2, "D": 4, "E": 12, "F": 2, "G": 3, "H": 2, "I": 9,
+    "J": 1, "K": 1, "L": 4, "M": 2, "N": 6, "O": 8, "P": 2, "Q": 1, "R": 6,
+    "S": 4, "T": 6, "U": 4, "V": 2, "W": 2, "X": 1, "Y": 2, "Z": 1, BLANK: 2,
+}
+TILE_VALUES = {
+    "A": 1, "B": 3, "C": 3, "D": 2, "E": 1, "F": 4, "G": 2, "H": 4, "I": 1,
+    "J": 8, "K": 5, "L": 1, "M": 3, "N": 1, "O": 1, "P": 3, "Q": 10, "R": 1,
+    "S": 1, "T": 1, "U": 1, "V": 4, "W": 4, "X": 8, "Y": 4, "Z": 10, BLANK: 0,
+}
+assert sum(TILE_COUNTS.values()) == TOTAL_TILES
+
+# T = triple word, D = double word, t = triple letter, d = double letter
+_HALF = [
+    "T..d...T...d..T",
+    ".D...t...t...D.",
+    "..D...d.d...D..",
+    "d..D...d...D..d",
+    "....D.....D....",
+    ".t...t...t...t.",
+    "..d...d.d...d..",
+]
+PREMIUMS = _HALF + ["T..d...D...d..T"] + _HALF[::-1]
+LETTER_MULT = [[{"d": 2, "t": 3}.get(ch, 1) for ch in row] for row in PREMIUMS]
+WORD_MULT = [[{"D": 2, "T": 3}.get(ch, 1) for ch in row] for row in PREMIUMS]
+
+HORIZONTAL = "H"
+VERTICAL = "V"
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Lexicon
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
-
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
-
-# ---------------------------------------------------------------------------
-# Data download
-# ---------------------------------------------------------------------------
-
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
-
-
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
-
-
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
-
-
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
-
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
+def load_lexicon(path=LEXICON_PATH):
+    """Return the set of valid words (uppercase). File format: 'WORD definition...' per line."""
+    if not os.path.exists(path):
+        print(f"Lexicon not found at {path}. Place NWL2023.txt next to prepare.py.")
         sys.exit(1)
-
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
-
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
-
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
-    )
-
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
-
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
-
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+    words = set()
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.split(None, 1)
+            if not parts:
+                continue
+            word = parts[0].upper()
+            if 2 <= len(word) <= BOARD_SIZE and word.isascii() and word.isalpha():
+                words.add(word)
+    return frozenset(words)
 
 # ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
+# Board and rules (imported by train.py)
 # ---------------------------------------------------------------------------
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
+class IllegalPlay(ValueError):
+    pass
 
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
 
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
+class Board:
+    """
+    Scrabble board with full play validation and scoring.
 
-    def get_vocab_size(self):
-        return self.enc.n_vocab
+    A play is (word, row, col, direction):
+      - word: the complete main word, including tiles already on the board.
+        Uppercase = regular tile, lowercase = blank standing for that letter.
+      - row, col: 0-indexed square of the word's first letter.
+      - direction: "H" (left to right) or "V" (top to bottom).
 
-    def get_bos_token_id(self):
-        return self.bos_token_id
+    grid[r][c] is None for an empty square, otherwise the tile's letter
+    (lowercase if the tile is a blank).
+    """
 
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
+    def __init__(self, lexicon):
+        self.lexicon = lexicon
+        self.grid = [[None] * BOARD_SIZE for _ in range(BOARD_SIZE)]
+        self.used = dict.fromkeys(TILE_COUNTS, 0)  # tiles on the board, blanks under "?"
+        self.num_tiles = 0
+
+    def copy(self):
+        other = Board.__new__(Board)
+        other.lexicon = self.lexicon
+        other.grid = [row[:] for row in self.grid]
+        other.used = dict(self.used)
+        other.num_tiles = self.num_tiles
+        return other
+
+    def tiles_left(self):
+        """Tiles not yet on the board (bag + racks), as {letter: count}."""
+        return {t: TILE_COUNTS[t] - n for t, n in self.used.items()}
+
+    def _analyze(self, word, row, col, direction):
+        """Validate a play. Returns (score, placed) where placed = [(r, c, tile_char)]."""
+        if direction == HORIZONTAL:
+            dr, dc = 0, 1
+        elif direction == VERTICAL:
+            dr, dc = 1, 0
         else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
+            raise IllegalPlay(f"bad direction {direction!r}")
+        n = len(word)
+        grid = self.grid
+        if n < 2:
+            raise IllegalPlay("word must have at least 2 letters")
+        if not (word.isascii() and word.isalpha()):
+            raise IllegalPlay(f"bad word {word!r}")
+        end_r, end_c = row + dr * (n - 1), col + dc * (n - 1)
+        if not (0 <= row and 0 <= col and end_r < BOARD_SIZE and end_c < BOARD_SIZE):
+            raise IllegalPlay("word does not fit on the board")
+        # The word given must be the complete run of tiles along its line
+        br, bc = row - dr, col - dc
+        if br >= 0 and bc >= 0 and grid[br][bc] is not None:
+            raise IllegalPlay("word is preceded by an existing tile")
+        ar, ac = end_r + dr, end_c + dc
+        if ar < BOARD_SIZE and ac < BOARD_SIZE and grid[ar][ac] is not None:
+            raise IllegalPlay("word is followed by an existing tile")
+        if word.upper() not in self.lexicon:
+            raise IllegalPlay(f"{word.upper()} is not in the lexicon")
 
-    def decode(self, ids):
-        return self.enc.decode(ids)
+        lexicon = self.lexicon
+        placed = []
+        main_sum = 0
+        main_mult = 1
+        cross_total = 0
+        connected = False
+        covers_center = False
+        for i, ch in enumerate(word):
+            r, c = row + dr * i, col + dc * i
+            existing = grid[r][c]
+            if existing is not None:
+                if existing.upper() != ch.upper():
+                    raise IllegalPlay(f"square ({r},{c}) holds {existing}, not {ch}")
+                main_sum += TILE_VALUES[existing] if existing.isupper() else 0
+                connected = True
+                continue
+            placed.append((r, c, ch))
+            if (r, c) == CENTER:
+                covers_center = True
+            value = (TILE_VALUES[ch] if ch.isupper() else 0) * LETTER_MULT[r][c]
+            wm = WORD_MULT[r][c]
+            main_sum += value
+            main_mult *= wm
+            # Cross-word formed perpendicular to the play through this tile
+            pr, pc = r - dc, c - dr
+            before = []
+            while pr >= 0 and pc >= 0 and grid[pr][pc] is not None:
+                before.append(grid[pr][pc])
+                pr -= dc
+                pc -= dr
+            pr, pc = r + dc, c + dr
+            after = []
+            while pr < BOARD_SIZE and pc < BOARD_SIZE and grid[pr][pc] is not None:
+                after.append(grid[pr][pc])
+                pr += dc
+                pc += dr
+            if before or after:
+                cross = "".join(before[::-1]) + ch + "".join(after)
+                if cross.upper() not in lexicon:
+                    raise IllegalPlay(f"cross-word {cross.upper()} is not in the lexicon")
+                cross_sum = value
+                for t in before:
+                    if t.isupper():
+                        cross_sum += TILE_VALUES[t]
+                for t in after:
+                    if t.isupper():
+                        cross_sum += TILE_VALUES[t]
+                cross_total += cross_sum * wm
+                connected = True
+
+        if not placed:
+            raise IllegalPlay("play places no tiles")
+        if len(placed) > RACK_SIZE:
+            raise IllegalPlay(f"play places {len(placed)} tiles (max {RACK_SIZE})")
+        if self.num_tiles == 0:
+            if not covers_center:
+                raise IllegalPlay("first play must cover the center square")
+        elif not connected:
+            raise IllegalPlay("play does not connect to existing tiles")
+        if self.num_tiles + len(placed) > MAX_TILES_ON_BOARD:
+            raise IllegalPlay("not enough tiles left in the game")
+        need = {}
+        for _, _, ch in placed:
+            tile = ch if ch.isupper() else BLANK
+            need[tile] = need.get(tile, 0) + 1
+        for tile, k in need.items():
+            if self.used[tile] + k > TILE_COUNTS[tile]:
+                raise IllegalPlay(f"not enough {tile} tiles left")
+
+        score = main_sum * main_mult + cross_total
+        if len(placed) == RACK_SIZE:
+            score += BINGO_BONUS
+        return score, placed
+
+    def score_play(self, word, row, col, direction):
+        """Score a play without making it. Raises IllegalPlay if it is not legal."""
+        return self._analyze(word, row, col, direction)[0]
+
+    def play(self, word, row, col, direction):
+        """Make a play and return its score. Raises IllegalPlay if it is not legal."""
+        score, placed = self._analyze(word, row, col, direction)
+        for r, c, ch in placed:
+            self.grid[r][c] = ch
+            self.used[ch if ch.isupper() else BLANK] += 1
+        self.num_tiles += len(placed)
+        return score
+
+    def __str__(self):
+        header = "    " + " ".join(f"{c:X}" for c in range(BOARD_SIZE))
+        rows = [header]
+        for r in range(BOARD_SIZE):
+            cells = [self.grid[r][c] or "." for c in range(BOARD_SIZE)]
+            rows.append(f"{r:3d} " + " ".join(cells))
+        return "\n".join(rows)
 
 
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
-    """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
-
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
-
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
+def format_play(play, score=None):
+    word, row, col, direction = play
+    text = f"{word:<15s} row {row:2d} col {col:2d} {direction}"
+    return text if score is None else f"{text}  {score:5d}"
 
 # ---------------------------------------------------------------------------
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+_LEXICON = None
+
+def replay_game(plays):
+    """Replay a game from an empty board. Returns (board, list of per-play scores)."""
+    global _LEXICON
+    if _LEXICON is None:
+        _LEXICON = load_lexicon()
+    board = Board(_LEXICON)
+    scores = []
+    for i, play in enumerate(plays):
+        word, row, col, direction = play
+        try:
+            scores.append(board.play(str(word), int(row), int(col), str(direction)))
+        except IllegalPlay as e:
+            raise IllegalPlay(f"play {i + 1} ({word} at {row},{col} {direction}): {e}") from None
+    return board, scores
+
+
+def evaluate_solution(plays):
     """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+    Ground-truth metric: the score of the final play of a fully legal game.
+    `plays` is a list of (word, row, col, direction) starting from an empty
+    board. Raises IllegalPlay if any play in the game is illegal. Higher is better.
     """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+    if not plays:
+        return 0
+    _, scores = replay_game(plays)
+    return scores[-1]
+
+
+def save_solution(plays, path="solution.json"):
+    score = evaluate_solution(plays)
+    with open(path, "w") as f:
+        json.dump({"score": score, "plays": [list(p) for p in plays]}, f, indent=1)
+    return score
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+def _self_test():
+    # MUZJIKS is the highest-scoring opening play in the lexicon: 128 points
+    assert evaluate_solution([("MUZJIKS", 7, 1, "H")]) == 128
+    # (10+1+1+10) x2 for the center square
+    assert evaluate_solution([("QUIZ", 7, 4, "H")]) == 44
+    # Existing tiles score face value, no premiums
+    assert evaluate_solution([("QUIZ", 7, 4, "H"), ("ZA", 7, 7, "V")]) == 11
+    # Main word FA (4x2 + 1 = 9) plus cross-word IF (1 + 4x2 = 9)
+    assert evaluate_solution([("QUIZ", 7, 4, "H"), ("ZA", 7, 7, "V"), ("FA", 8, 6, "H")]) == 18
+    # A blank scores zero
+    assert evaluate_solution([("QUIz", 7, 4, "H")]) == 24
+    illegal = [
+        [("QUIZ", 7, 0, "H")],                         # misses the center
+        [("QUIZ", 7, 4, "H"), ("ZA", 0, 0, "H")],      # disconnected
+        [("QUIZ", 7, 4, "H"), ("QUIZ", 7, 4, "H")],    # places nothing
+        [("QUIZ", 7, 4, "H"), ("ZZZ", 7, 7, "V")],     # only one Z in the bag
+        [("QUIZ", 7, 4, "H"), ("QUI", 7, 4, "H")],     # not the complete run
+        [("QUIZ", 7, 4, "H"), ("XA", 8, 6, "H")],      # invalid cross-words
+        [("ZZXQ", 7, 4, "H")],                         # not a word
+    ]
+    for plays in illegal:
+        try:
+            evaluate_solution(plays)
+        except IllegalPlay:
+            continue
+        raise AssertionError(f"expected illegal: {plays}")
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser = argparse.ArgumentParser(description="Lexicon check and solution verifier for Scrabble autoresearch")
+    parser.add_argument("--verify", metavar="SOLUTION_JSON", help="re-score a solution file written by train.py")
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
+    lexicon = load_lexicon()
+    print(f"Lexicon: {len(lexicon):,} words from {LEXICON_PATH}")
 
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
-
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
-
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    if args.verify:
+        with open(args.verify) as f:
+            plays = [tuple(p) for p in json.load(f)["plays"]]
+        board, scores = replay_game(plays)
+        for play, score in zip(plays, scores):
+            print(format_play(play, score))
+        print(board)
+        print(f"best_score:       {scores[-1] if scores else 0}")
+    else:
+        _self_test()
+        print("Scorer: self-tests passed")
+        print()
+        print("Done! Ready to search.")
